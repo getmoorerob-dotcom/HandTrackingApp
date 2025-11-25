@@ -225,13 +225,17 @@ hands.onResults(onResults);
 console.log("Hands solution configured.");
 
 // -------------------------------------------------------------
-// Start camera with getUserMedia
+// Start camera with getUserMedia (front-facing on phones)
 // -------------------------------------------------------------
 async function initCamera() {
   try {
     console.log("Requesting camera access…");
     const stream = await navigator.mediaDevices.getUserMedia({
-      video: { width: 640, height: 480 }
+      video: {
+        width: 640,
+        height: 480,
+        facingMode: "user"   // front-facing camera on phones (selfie cam)
+      }
     });
     console.log("Camera stream acquired.");
     videoEl.srcObject = stream;
