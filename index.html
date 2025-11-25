@@ -61,6 +61,7 @@
 
 <div id="controls">
   <button id="downloadBtn">Download CSV</button>
+  <button id="switchBtn">Switch Camera</button>
   <span id="status">Initializing…</span>
 </div>
 
@@ -80,6 +81,7 @@ const canvasEl = document.getElementById("canvas");
 const ctx = canvasEl.getContext("2d");
 const statusEl = document.getElementById("status");
 const downloadBtn = document.getElementById("downloadBtn");
+const switchBtn = document.getElementById("switchBtn");
 
 // -------------------------------------------------------------
 // Data storage for CSV
@@ -88,6 +90,10 @@ let rows = [];
 let frameIndex = 0;
 let startTime = performance.now(); // high-resolution timer
 let running = false;
+
+// Camera state
+let useFrontCamera = true;  // true = front/selfie, false = back
+let currentStream = null;
 
 // -------------------------------------------------------------
 // Angle function: angle at point B given A-B-C
@@ -225,35 +231,48 @@ hands.onResults(onResults);
 console.log("Hands solution configured.");
 
 // -------------------------------------------------------------
-// Start camera with getUserMedia (front-facing on phones)
+// Start / restart camera with getUserMedia
 // -------------------------------------------------------------
 async function initCamera() {
   try {
-    console.log("Requesting camera access…");
-    const stream = await navigator.mediaDevices.getUserMedia({
+    // stop previous loop and stream if switching camera
+    running = false;
+    statusEl.textContent = "Requesting camera…";
+
+    if (currentStream) {
+      currentStream.getTracks().forEach(t => t.stop());
+      currentStream = null;
+    }
+
+    const constraints = {
       video: {
         width: 640,
         height: 480,
-        facingMode: "user"   // front-facing camera on phones (selfie cam)
+        facingMode: useFrontCamera ? "user" : "environment"
       }
-    });
-    console.log("Camera stream acquired.");
+    };
+
+    const stream = await navigator.mediaDevices.getUserMedia(constraints);
+    currentStream = stream;
+
     videoEl.srcObject = stream;
     await videoEl.play();
 
-    // Resize canvas to match video
-    canvasEl.width = videoEl.videoWidth;
-    canvasEl.height = videoEl.videoHeight;
+    canvasEl.width = videoEl.videoWidth || 640;
+    canvasEl.height = videoEl.videoHeight || 480;
     console.log("Video size:", videoEl.videoWidth, videoEl.videoHeight);
 
     startTime = performance.now();
+    frameIndex = 0; // optional: reset frame count on camera switch
     running = true;
-    statusEl.textContent = "Recording… (frames: 0, rows: 0)";
 
-    // Kick off the processing loop
+    statusEl.textContent =
+      `Recording… (Camera: ${useFrontCamera ? "Front" : "Back"}; frames: 0, rows: ${rows.length})`;
+
     requestAnimationFrame(processFrame);
+
   } catch (err) {
-    console.error("Error accessing camera:", err);
+    console.error("Camera error:", err);
     statusEl.textContent = "Camera error: " + err.message;
   }
 }
@@ -282,6 +301,8 @@ async function processFrame() {
 // Main callback: draw + compute angles + record data
 // -------------------------------------------------------------
 function onResults(results) {
+  if (!running) return;
+
   frameIndex += 1;
   const t = (performance.now() - startTime) / 1000.0; // seconds since start
 
@@ -354,7 +375,7 @@ function onResults(results) {
   }
 
   statusEl.textContent =
-    `Hands: ${handsDetected} | frames: ${frameIndex}, rows: ${rows.length}`;
+    `Hands: ${handsDetected} | Camera: ${useFrontCamera ? "Front" : "Back"} | frames: ${frameIndex}, rows: ${rows.length}`;
 
   ctx.restore();
 }
@@ -403,7 +424,15 @@ function downloadCSV() {
   URL.revokeObjectURL(url);
 }
 
+// -------------------------------------------------------------
+// Event handlers
+// -------------------------------------------------------------
 downloadBtn.addEventListener("click", downloadCSV);
+
+switchBtn.addEventListener("click", () => {
+  useFrontCamera = !useFrontCamera;
+  initCamera();
+});
 
 // -------------------------------------------------------------
 // Kick everything off
@@ -413,3 +442,4 @@ initCamera();
 
 </body>
 </html>
+
