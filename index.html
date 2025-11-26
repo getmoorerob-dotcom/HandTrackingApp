@@ -19,7 +19,6 @@
       height: 100vh;
       object-fit: cover;
     }
-    /* Make sure canvas is on top of video */
     video {
       z-index: 1;
     }
@@ -68,7 +67,6 @@
 <video id="video" playsinline></video>
 <canvas id="canvas"></canvas>
 
-<!-- Pin a specific MediaPipe Hands version -->
 <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
 <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils@0.4.1675469240/drawing_utils.js" crossorigin="anonymous"></script>
 
@@ -84,66 +82,76 @@ const downloadBtn = document.getElementById("downloadBtn");
 const switchBtn = document.getElementById("switchBtn");
 
 // -------------------------------------------------------------
-// Data storage for CSV
+// Data storage for CSV (with chunking)
 // -------------------------------------------------------------
 let rows = [];
 let frameIndex = 0;
-let startTime = performance.now(); // high-resolution timer
+let startTime = performance.now();
 let running = false;
 
+const MAX_ROWS_PER_FILE = 7500;
+let fileIndex = 1;
+const sessionTimestamp = new Date().toISOString().replace(/[:.]/g, "-");
+
 // Camera state
-let useFrontCamera = true;  // true = front/selfie, false = back
+let useFrontCamera = true;
 let currentStream = null;
 
 // -------------------------------------------------------------
-// Angle function: angle at point B given A-B-C
+// Angle function (safe)
 // -------------------------------------------------------------
 function angle3pts(A, B, C) {
-  const BA = {
-    x: A.x - B.x,
-    y: A.y - B.y,
-    z: A.z - B.z
-  };
-  const BC = {
-    x: C.x - B.x,
-    y: C.y - B.y,
-    z: C.z - B.z
-  };
+  if (!A || !B || !C) return 0.0;
 
-  const dot = BA.x * BC.x + BA.y * BC.y + BA.z * BC.z;
-  const magBA = Math.sqrt(BA.x * BA.x + BA.y * BA.y + BA.z * BA.z);
-  const magBC = Math.sqrt(BC.x * BC.x + BC.y * BC.y + BC.z * BC.z);
+  const BA = { x: A.x - B.x, y: A.y - B.y, z: (A.z ?? 0) - (B.z ?? 0) };
+  const BC = { x: C.x - B.x, y: C.y - B.y, z: (C.z ?? 0) - (B.z ?? 0) };
 
-  if (magBA * magBC === 0) return 0.0;
+  const dot  = BA.x * BC.x + BA.y * BC.y + BA.z * BC.z;
+  const magBA = Math.sqrt(BA.x**2 + BA.y**2 + BA.z**2);
+  const magBC = Math.sqrt(BC.x**2 + BC.y**2 + BC.z**2);
+
+  if (magBA === 0 || magBC === 0) return 0.0;
 
   let cosAngle = dot / (magBA * magBC);
-  cosAngle = Math.min(1.0, Math.max(-1.0, cosAngle)); // clamp
-  return (Math.acos(cosAngle) * 180) / Math.PI;
+  cosAngle = Math.min(1, Math.max(-1, cosAngle));
+  return Math.acos(cosAngle) * 180 / Math.PI;
 }
 
-// Helper for MCP/PIP/DIP on non-thumb fingers
+// -------------------------------------------------------------
+// Finger angle helpers (safe)
+// -------------------------------------------------------------
 function computeFingerAngles(lm, mcpIdx, pipIdx, dipIdx, tipIdx) {
-  const mcp = angle3pts(lm[0], lm[mcpIdx], lm[pipIdx]);       // Wrist–MCP–PIP
-  const pip = angle3pts(lm[mcpIdx], lm[pipIdx], lm[dipIdx]);  // MCP–PIP–DIP
-  const dip = angle3pts(lm[pipIdx], lm[dipIdx], lm[tipIdx]);  // PIP–DIP–TIP
-  return [mcp, pip, dip];
+  if (!lm || lm.length <= tipIdx) return [0, 0, 0];
+
+  const wrist = lm[0];
+  const mcp   = lm[mcpIdx];
+  const pip   = lm[pipIdx];
+  const dip   = lm[dipIdx];
+  const tip   = lm[tipIdx];
+
+  if (!wrist || !mcp || !pip || !dip || !tip) return [0, 0, 0];
+
+  const mcpAngle = angle3pts(wrist, mcp, pip);
+  const pipAngle = angle3pts(mcp, pip, dip);
+  const dipAngle = angle3pts(pip, dip, tip);
+
+  return [mcpAngle, pipAngle, dipAngle];
 }
 
-// Compute all angles for one hand's landmarks
 function getHandAngles(lm) {
-  // Thumb: 1 = CMC, 2 = MCP, 3 = IP, 4 = TIP
+  if (!lm || lm.length < 21) return null;
+
   const thumb_mcp = angle3pts(lm[1], lm[2], lm[3]);
   const thumb_ip  = angle3pts(lm[2], lm[3], lm[4]);
 
-  // Other fingers: MCP/PIP/DIP
   const [index_mcp, index_pip, index_dip] =
-    computeFingerAngles(lm, 5, 6, 7, 8);       // Index: 5–8
+    computeFingerAngles(lm, 5, 6, 7, 8);
   const [middle_mcp, middle_pip, middle_dip] =
-    computeFingerAngles(lm, 9, 10, 11, 12);    // Middle: 9–12
+    computeFingerAngles(lm, 9, 10, 11, 12);
   const [ring_mcp, ring_pip, ring_dip] =
-    computeFingerAngles(lm, 13, 14, 15, 16);   // Ring: 13–16
+    computeFingerAngles(lm, 13, 14, 15, 16);
   const [pinky_mcp, pinky_pip, pinky_dip] =
-    computeFingerAngles(lm, 17, 18, 19, 20);   // Pinky: 17–20
+    computeFingerAngles(lm, 17, 18, 19, 20);
 
   return {
     thumb_mcp,
@@ -167,20 +175,19 @@ function getHandAngles(lm) {
 // Manual hand connections for drawing
 // -------------------------------------------------------------
 const MANUAL_CONNECTIONS = [
-  // Thumb
   [0, 1], [1, 2], [2, 3], [3, 4],
-  // Index
   [0, 5], [5, 6], [6, 7], [7, 8],
-  // Middle
-  [0, 9], [9, 10], [10, 11], [11, 12],
-  // Ring
-  [0, 13], [13, 14], [14, 15], [15, 16],
-  // Pinky
-  [0, 17], [17, 18], [18, 19], [19, 20]
+  [0, 9], [9,10], [10,11], [11,12],
+  [0,13], [13,14], [14,15], [15,16],
+  [0,17], [17,18], [18,19], [19,20]
 ];
 
-// Draw a single hand in a given color
+// -------------------------------------------------------------
+// Draw a single hand (fully defensive)
+// -------------------------------------------------------------
 function drawHand(lm, color) {
+  if (!Array.isArray(lm) || lm.length === 0) return;
+
   ctx.lineWidth = 3;
   ctx.strokeStyle = color;
   ctx.fillStyle = color;
@@ -189,6 +196,8 @@ function drawHand(lm, color) {
   for (const [i, j] of MANUAL_CONNECTIONS) {
     const p1 = lm[i];
     const p2 = lm[j];
+    if (!p1 || !p2 || typeof p1.x !== "number" || typeof p2.x !== "number") continue;
+
     const x1 = p1.x * canvasEl.width;
     const y1 = p1.y * canvasEl.height;
     const x2 = p2.x * canvasEl.width;
@@ -200,8 +209,9 @@ function drawHand(lm, color) {
     ctx.stroke();
   }
 
-  // Draw landmarks as circles
+  // Draw landmarks
   for (const p of lm) {
+    if (!p || typeof p.x !== "number") continue;
     const x = p.x * canvasEl.width;
     const y = p.y * canvasEl.height;
     ctx.beginPath();
@@ -211,9 +221,8 @@ function drawHand(lm, color) {
 }
 
 // -------------------------------------------------------------
-// Initialize MediaPipe Hands (version-pinned)
+// Initialize MediaPipe Hands
 // -------------------------------------------------------------
-console.log("Creating Hands solution…");
 const hands = new Hands({
   locateFile: (file) =>
     `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${file}`
@@ -221,21 +230,19 @@ const hands = new Hands({
 
 hands.setOptions({
   selfieMode: true,
-  maxNumHands: 2,             // allow up to 2 hands
+  maxNumHands: 2,
   modelComplexity: 1,
   minDetectionConfidence: 0.7,
   minTrackingConfidence: 0.7
 });
 
 hands.onResults(onResults);
-console.log("Hands solution configured.");
 
 // -------------------------------------------------------------
-// Start / restart camera with getUserMedia
+// Camera
 // -------------------------------------------------------------
 async function initCamera() {
   try {
-    // stop previous loop and stream if switching camera
     running = false;
     statusEl.textContent = "Requesting camera…";
 
@@ -258,19 +265,17 @@ async function initCamera() {
     videoEl.srcObject = stream;
     await videoEl.play();
 
-    canvasEl.width = videoEl.videoWidth || 640;
+    canvasEl.width  = videoEl.videoWidth  || 640;
     canvasEl.height = videoEl.videoHeight || 480;
-    console.log("Video size:", videoEl.videoWidth, videoEl.videoHeight);
 
     startTime = performance.now();
-    frameIndex = 0; // optional: reset frame count on camera switch
+    frameIndex = 0;
     running = true;
 
     statusEl.textContent =
       `Recording… (Camera: ${useFrontCamera ? "Front" : "Back"}; frames: 0, rows: ${rows.length})`;
 
     requestAnimationFrame(processFrame);
-
   } catch (err) {
     console.error("Camera error:", err);
     statusEl.textContent = "Camera error: " + err.message;
@@ -278,7 +283,7 @@ async function initCamera() {
 }
 
 // -------------------------------------------------------------
-// Processing loop: send each frame to MediaPipe
+// Processing loop
 // -------------------------------------------------------------
 async function processFrame() {
   if (!running) return;
@@ -289,8 +294,7 @@ async function processFrame() {
     } catch (e) {
       console.error("Error in hands.send:", e);
       statusEl.textContent = "Error in hands.send (see console)";
-      running = false;
-      return;
+      // DO NOT set running=false here; let the loop continue
     }
   }
 
@@ -298,106 +302,102 @@ async function processFrame() {
 }
 
 // -------------------------------------------------------------
-// Main callback: draw + compute angles + record data
+// Main callback (wrapped in try/catch)
 // -------------------------------------------------------------
 function onResults(results) {
-  if (!running) return;
+  try {
+    if (!running) return;
 
-  frameIndex += 1;
-  const t = (performance.now() - startTime) / 1000.0; // seconds since start
+    frameIndex += 1;
+    const t = (performance.now() - startTime) / 1000.0;
 
-  ctx.save();
-  ctx.clearRect(0, 0, canvasEl.width, canvasEl.height);
-  ctx.drawImage(results.image, 0, 0, canvasEl.width, canvasEl.height);
+    ctx.save();
+    ctx.clearRect(0, 0, canvasEl.width, canvasEl.height);
+    ctx.drawImage(results.image, 0, 0, canvasEl.width, canvasEl.height);
 
-  let leftAngles = null;
-  let rightAngles = null;
-  let handsDetected = 0;
+    let leftAngles  = null;
+    let rightAngles = null;
+    let handsDetected = 0;
 
-  if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
-    const lms = results.multiHandLandmarks;
-    const handedness = results.multiHandedness || [];
+    if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+      const lms = results.multiHandLandmarks;
+      const handedness = results.multiHandedness || [];
 
-    for (let i = 0; i < lms.length; i++) {
-      const lm = lms[i];
-      const handInfo = handedness[i];
-      let label = 'Unknown';
-      if (handInfo && handInfo.label) {
-        label = handInfo.label;  // "Left" or "Right"
+      for (let i = 0; i < lms.length; i++) {
+        const lm = lms[i];
+        if (!lm) continue;
+
+        const handInfo = handedness[i];
+        let label = handInfo && handInfo.label ? handInfo.label : "Unknown";
+        const labelLower = label.toLowerCase();
+
+        let color = "#ffff00";
+        if (labelLower === "right") color = "#ff0000";
+        else if (labelLower === "left") color = "#00aaff";
+
+        drawHand(lm, color);
+
+        const angles = getHandAngles(lm);
+        if (!angles) continue;
+
+        if (labelLower === "left") {
+          leftAngles = angles;
+        } else if (labelLower === "right") {
+          rightAngles = angles;
+        }
+
+        handsDetected++;
       }
+    }
 
-      const labelLower = label.toLowerCase();
-      let color = '#ffff00'; // default yellow if unknown
+    const row = {
+      frame: frameIndex,
+      time_sec: t.toFixed(6)
+    };
 
-      if (labelLower === 'right') {
-        color = '#ff0000'; // right hand red
-      } else if (labelLower === 'left') {
-        color = '#00aaff'; // left hand blue
+    if (leftAngles) {
+      for (const [k, v] of Object.entries(leftAngles)) {
+        row["left_" + k] = v;
       }
-
-      // Draw this hand
-      drawHand(lm, color);
-
-      // Compute angles
-      const angles = getHandAngles(lm);
-
-      if (labelLower === 'left') {
-        leftAngles = angles;
-      } else if (labelLower === 'right') {
-        rightAngles = angles;
+    }
+    if (rightAngles) {
+      for (const [k, v] of Object.entries(rightAngles)) {
+        row["right_" + k] = v;
       }
-
-      handsDetected++;
     }
-  }
 
-  // Build a row for this frame (one row per frame, both hands)
-  const row = {
-    frame: frameIndex,
-    time_sec: t.toFixed(6)
-  };
-
-  if (leftAngles) {
-    for (const [k, v] of Object.entries(leftAngles)) {
-      row['left_' + k] = v;
+    if (leftAngles || rightAngles) {
+      rows.push(row);
+      if (rows.length >= MAX_ROWS_PER_FILE) {
+        exportCurrentChunk();
+      }
     }
+
+    statusEl.textContent =
+      `Hands: ${handsDetected} | Camera: ${useFrontCamera ? "Front" : "Back"} | ` +
+      `frames: ${frameIndex}, rows: ${rows.length}`;
+
+    ctx.restore();
+  } catch (err) {
+    console.error("onResults error:", err);
+    statusEl.textContent = "onResults error (see console)";
+    // We don't stop running; just skip this frame.
   }
-
-  if (rightAngles) {
-    for (const [k, v] of Object.entries(rightAngles)) {
-      row['right_' + k] = v;
-    }
-  }
-
-  // Only push a row if at least one hand is visible
-  if (leftAngles || rightAngles) {
-    rows.push(row);
-  }
-
-  statusEl.textContent =
-    `Hands: ${handsDetected} | Camera: ${useFrontCamera ? "Front" : "Back"} | frames: ${frameIndex}, rows: ${rows.length}`;
-
-  ctx.restore();
 }
 
 // -------------------------------------------------------------
-// CSV export
+// CSV export (chunked)
 // -------------------------------------------------------------
-function downloadCSV() {
-  if (rows.length === 0) {
-    alert("No data recorded yet.");
-    return;
-  }
+function exportCurrentChunk() {
+  if (rows.length === 0) return;
 
   const headers = [
     "frame", "time_sec",
-    // left hand columns
     "left_thumb_mcp", "left_thumb_ip",
     "left_index_mcp", "left_index_pip", "left_index_dip",
     "left_middle_mcp", "left_middle_pip", "left_middle_dip",
     "left_ring_mcp", "left_ring_pip", "left_ring_dip",
     "left_pinky_mcp", "left_pinky_pip", "left_pinky_dip",
-    // right hand columns
     "right_thumb_mcp", "right_thumb_ip",
     "right_index_mcp", "right_index_pip", "right_index_dip",
     "right_middle_mcp", "right_middle_pip", "right_middle_dip",
@@ -405,30 +405,44 @@ function downloadCSV() {
     "right_pinky_mcp", "right_pinky_pip", "right_pinky_dip"
   ];
 
-  let csv = headers.join(",") + "\n";
+  const lines = [];
+  lines.push(headers.join(","));
+
   for (const row of rows) {
     const line = headers.map(h => (row[h] !== undefined ? row[h] : "")).join(",");
-    csv += line + "\n";
+    lines.push(line);
   }
 
+  const csv = lines.join("\n");
   const blob = new Blob([csv], { type: "text/csv" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
-  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const partStr = String(fileIndex).padStart(3, "0");
+  const filename = `hand_joint_angles_bothhands_${sessionTimestamp}_part${partStr}.csv`;
 
   a.href = url;
-  a.download = `hand_joint_angles_bothhands_${timestamp}.csv`;
+  a.download = filename;
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
+
+  fileIndex += 1;
+  rows = [];
+}
+
+function downloadCSV() {
+  if (rows.length === 0) {
+    alert("No data recorded in current chunk.");
+    return;
+  }
+  exportCurrentChunk();
 }
 
 // -------------------------------------------------------------
 // Event handlers
 // -------------------------------------------------------------
 downloadBtn.addEventListener("click", downloadCSV);
-
 switchBtn.addEventListener("click", () => {
   useFrontCamera = !useFrontCamera;
   initCamera();
@@ -442,4 +456,3 @@ initCamera();
 
 </body>
 </html>
-
