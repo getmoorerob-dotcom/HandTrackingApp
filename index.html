@@ -1,8 +1,12 @@
+hile keeping the local CSV download backup and your existing chunking/trial structure. Your current script already had the right chunked export flow to build on.
+
+Replace your current HTML with this version, then paste your Apps Script web app URL into UPLOAD_URL.
+
 <!DOCTYPE html>
 <html>
 <head>
   <meta charset="UTF-8" />
-  <title>Hand Joint Angles Recorder (Both Hands)</title>
+  <title>Hand Joint Angles & Wrist Tracker (Both Hands)</title>
   <style>
     body {
       margin: 0;
@@ -37,6 +41,8 @@
       display: flex;
       gap: 8px;
       align-items: center;
+      flex-wrap: wrap;
+      max-width: 95vw;
     }
     button {
       padding: 6px 10px;
@@ -50,15 +56,41 @@
     button:hover {
       background: #333;
     }
+    input {
+      padding: 4px 6px;
+      border-radius: 4px;
+      border: 1px solid #666;
+      background: #111;
+      color: #fff;
+      font-size: 12px;
+      max-width: 130px;
+    }
+    label {
+      font-size: 11px;
+      opacity: 0.9;
+    }
     #status {
       font-size: 12px;
-      opacity: 0.8;
+      opacity: 0.9;
+      max-width: 420px;
+      line-height: 1.3;
     }
   </style>
 </head>
 <body>
 
 <div id="controls">
+  <label>
+    Participant:
+    <input id="participantInput" type="text" placeholder="e.g. S01" />
+  </label>
+  <label>
+    Camera:
+    <input id="cameraInput" type="text" placeholder="e.g. top" />
+  </label>
+
+  <button id="startBtn">Start Trial</button>
+  <button id="stopBtn">Stop Trial</button>
   <button id="downloadBtn">Download CSV</button>
   <button id="switchBtn">Switch Camera</button>
   <span id="status">Initializing…</span>
@@ -72,6 +104,18 @@
 
 <script>
 // -------------------------------------------------------------
+// CONFIG
+// -------------------------------------------------------------
+// Paste your deployed Google Apps Script web app URL here
+const UPLOAD_URL = "https://script.google.com/macros/s/AKfycbyFuh6Huu-f5cHiBgOqPdsK4kKuS9HlXoj1ao5y39wsknR1lvqJ5FaB_U8Z93vFpo-a/exec";
+
+// Keep local CSV downloads as backup
+const ENABLE_LOCAL_DOWNLOAD_BACKUP = true;
+
+// Toggle auto upload
+const ENABLE_AUTO_UPLOAD = true;
+
+// -------------------------------------------------------------
 // DOM elements
 // -------------------------------------------------------------
 const videoEl = document.getElementById("video");
@@ -80,6 +124,10 @@ const ctx = canvasEl.getContext("2d");
 const statusEl = document.getElementById("status");
 const downloadBtn = document.getElementById("downloadBtn");
 const switchBtn = document.getElementById("switchBtn");
+const startBtn = document.getElementById("startBtn");
+const stopBtn = document.getElementById("stopBtn");
+const participantInput = document.getElementById("participantInput");
+const cameraInput = document.getElementById("cameraInput");
 
 // -------------------------------------------------------------
 // Data storage for CSV (with chunking)
@@ -88,6 +136,8 @@ let rows = [];
 let frameIndex = 0;
 let startTime = performance.now();
 let running = false;
+let isRecording = false;
+let trialIndex = 0;
 
 const MAX_ROWS_PER_FILE = 7500;
 let fileIndex = 1;
@@ -96,6 +146,12 @@ const sessionTimestamp = new Date().toISOString().replace(/[:.]/g, "-");
 // Camera state
 let useFrontCamera = true;
 let currentStream = null;
+
+// Upload queue state
+let uploadQueue = [];
+let uploadInProgress = false;
+let successfulUploads = 0;
+let failedUploads = 0;
 
 // -------------------------------------------------------------
 // Angle function (safe)
@@ -192,7 +248,6 @@ function drawHand(lm, color) {
   ctx.strokeStyle = color;
   ctx.fillStyle = color;
 
-  // Draw connections
   for (const [i, j] of MANUAL_CONNECTIONS) {
     const p1 = lm[i];
     const p2 = lm[j];
@@ -209,7 +264,6 @@ function drawHand(lm, color) {
     ctx.stroke();
   }
 
-  // Draw landmarks
   for (const p of lm) {
     if (!p || typeof p.x !== "number") continue;
     const x = p.x * canvasEl.width;
@@ -239,11 +293,135 @@ hands.setOptions({
 hands.onResults(onResults);
 
 // -------------------------------------------------------------
+// Helpers
+// -------------------------------------------------------------
+function sanitizeForFilename(value) {
+  return String(value || "").trim().replace(/[^a-zA-Z0-9._-]/g, "_") || "unknown";
+}
+
+function currentTrialLabel() {
+  return isRecording ? `REC (trial ${trialIndex})` : "Idle";
+}
+
+function updateStatus(extra = "") {
+  const base =
+    `${currentTrialLabel()} | Camera: ${useFrontCamera ? "Front" : "Back"} | ` +
+    `frames: ${frameIndex}, rows: ${rows.length} | ` +
+    `uploads ok: ${successfulUploads}, failed: ${failedUploads}, queued: ${uploadQueue.length}`;
+  statusEl.textContent = extra ? `${base} | ${extra}` : base;
+}
+
+function buildCsvFromRows(rowsToExport) {
+  const headers = [
+    "participant_id",
+    "camera_id",
+    "trial_id",
+    "frame",
+    "time_sec",
+    "wall_time_ms",
+    "left_wrist_x", "left_wrist_y", "left_wrist_z",
+    "right_wrist_x", "right_wrist_y", "right_wrist_z",
+    "left_thumb_mcp", "left_thumb_ip",
+    "left_index_mcp", "left_index_pip", "left_index_dip",
+    "left_middle_mcp", "left_middle_pip", "left_middle_dip",
+    "left_ring_mcp", "left_ring_pip", "left_ring_dip",
+    "left_pinky_mcp", "left_pinky_pip", "left_pinky_dip",
+    "right_thumb_mcp", "right_thumb_ip",
+    "right_index_mcp", "right_index_pip", "right_index_dip",
+    "right_middle_mcp", "right_middle_pip", "right_middle_dip",
+    "right_ring_mcp", "right_ring_pip", "right_ring_dip",
+    "right_pinky_mcp", "right_pinky_pip", "right_pinky_dip"
+  ];
+
+  const lines = [];
+  lines.push(headers.join(","));
+
+  for (const row of rowsToExport) {
+    const line = headers.map(h => (row[h] !== undefined ? row[h] : "")).join(",");
+    lines.push(line);
+  }
+
+  return {
+    headers,
+    csvText: lines.join("\n")
+  };
+}
+
+function getChunkFilename(participantId, cameraId, trialId, chunkIndex) {
+  const safeParticipant = sanitizeForFilename(participantId);
+  const safeCamera = sanitizeForFilename(cameraId);
+  const safeTrial = sanitizeForFilename(trialId);
+  const partStr = String(chunkIndex).padStart(3, "0");
+
+  return `hand_joint_angles_wrist_${safeParticipant}_${safeCamera}_trial${safeTrial}_${sessionTimestamp}_part${partStr}.csv`;
+}
+
+// -------------------------------------------------------------
+// Upload queue
+// -------------------------------------------------------------
+async function enqueueUpload(payload) {
+  uploadQueue.push(payload);
+  updateStatus(`Queued ${payload.filename}`);
+  if (!uploadInProgress) {
+    await processUploadQueue();
+  }
+}
+
+async function processUploadQueue() {
+  if (uploadInProgress) return;
+  uploadInProgress = true;
+
+  try {
+    while (uploadQueue.length > 0) {
+      const payload = uploadQueue[0];
+
+      try {
+        const res = await fetch(UPLOAD_URL, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify(payload)
+        });
+
+        const text = await res.text();
+        let parsed;
+
+        try {
+          parsed = JSON.parse(text);
+        } catch (_) {
+          parsed = { ok: false, error: "Non-JSON response from upload endpoint", raw: text };
+        }
+
+        if (!res.ok || !parsed.ok) {
+          failedUploads += 1;
+          console.error("Upload failed:", parsed);
+          updateStatus(`Upload failed: ${payload.filename}`);
+          break;
+        }
+
+        successfulUploads += 1;
+        uploadQueue.shift();
+        updateStatus(`Uploaded ${payload.filename}`);
+      } catch (err) {
+        failedUploads += 1;
+        console.error("Network/upload error:", err);
+        updateStatus(`Network/upload error: ${payload.filename}`);
+        break;
+      }
+    }
+  } finally {
+    uploadInProgress = false;
+  }
+}
+
+// -------------------------------------------------------------
 // Camera
 // -------------------------------------------------------------
 async function initCamera() {
   try {
     running = false;
+    isRecording = false;
     statusEl.textContent = "Requesting camera…";
 
     if (currentStream) {
@@ -270,10 +448,11 @@ async function initCamera() {
 
     startTime = performance.now();
     frameIndex = 0;
-    running = true;
 
+    running = true;
     statusEl.textContent =
-      `Recording… (Camera: ${useFrontCamera ? "Front" : "Back"}; frames: 0, rows: ${rows.length})`;
+      `Camera ready (${useFrontCamera ? "Front" : "Back"}). ` +
+      `Set Participant/Camera and press "Start Trial" to record.`;
 
     requestAnimationFrame(processFrame);
   } catch (err) {
@@ -294,7 +473,6 @@ async function processFrame() {
     } catch (e) {
       console.error("Error in hands.send:", e);
       statusEl.textContent = "Error in hands.send (see console)";
-      // DO NOT set running=false here; let the loop continue
     }
   }
 
@@ -302,14 +480,11 @@ async function processFrame() {
 }
 
 // -------------------------------------------------------------
-// Main callback (wrapped in try/catch)
+// Main callback
 // -------------------------------------------------------------
 function onResults(results) {
   try {
     if (!running) return;
-
-    frameIndex += 1;
-    const t = (performance.now() - startTime) / 1000.0;
 
     ctx.save();
     ctx.clearRect(0, 0, canvasEl.width, canvasEl.height);
@@ -317,6 +492,8 @@ function onResults(results) {
 
     let leftAngles  = null;
     let rightAngles = null;
+    let leftWrist   = null;
+    let rightWrist  = null;
     let handsDetected = 0;
 
     if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
@@ -342,95 +519,132 @@ function onResults(results) {
 
         if (labelLower === "left") {
           leftAngles = angles;
+          leftWrist = lm[0] || null;
         } else if (labelLower === "right") {
           rightAngles = angles;
+          rightWrist = lm[0] || null;
         }
 
         handsDetected++;
       }
     }
 
-    const row = {
-      frame: frameIndex,
-      time_sec: t.toFixed(6)
-    };
+    if (isRecording) {
+      frameIndex += 1;
+      const elapsedSec = (performance.now() - startTime) / 1000.0;
+      const wallTimeMs = Date.now();
 
-    if (leftAngles) {
-      for (const [k, v] of Object.entries(leftAngles)) {
-        row["left_" + k] = v;
+      const participantId = participantInput.value.trim() || "";
+      const cameraId = cameraInput.value.trim() || "";
+
+      const row = {
+        participant_id: participantId,
+        camera_id: cameraId,
+        trial_id: trialIndex,
+        frame: frameIndex,
+        time_sec: elapsedSec.toFixed(6),
+        wall_time_ms: wallTimeMs
+      };
+
+      if (leftWrist) {
+        row.left_wrist_x = leftWrist.x;
+        row.left_wrist_y = leftWrist.y;
+        row.left_wrist_z = leftWrist.z ?? 0;
+      }
+      if (rightWrist) {
+        row.right_wrist_x = rightWrist.x;
+        row.right_wrist_y = rightWrist.y;
+        row.right_wrist_z = rightWrist.z ?? 0;
+      }
+
+      if (leftAngles) {
+        for (const [k, v] of Object.entries(leftAngles)) {
+          row["left_" + k] = v;
+        }
+      }
+      if (rightAngles) {
+        for (const [k, v] of Object.entries(rightAngles)) {
+          row["right_" + k] = v;
+        }
+      }
+
+      if (leftAngles || rightAngles || leftWrist || rightWrist) {
+        rows.push(row);
+
+        if (rows.length >= MAX_ROWS_PER_FILE) {
+          exportCurrentChunk();
+        }
       }
     }
-    if (rightAngles) {
-      for (const [k, v] of Object.entries(rightAngles)) {
-        row["right_" + k] = v;
-      }
-    }
 
-    if (leftAngles || rightAngles) {
-      rows.push(row);
-      if (rows.length >= MAX_ROWS_PER_FILE) {
-        exportCurrentChunk();
-      }
-    }
+    const base =
+      `${currentTrialLabel()} | Hands: ${handsDetected} | Camera: ${useFrontCamera ? "Front" : "Back"} | ` +
+      `frames: ${frameIndex}, rows: ${rows.length} | ` +
+      `uploads ok: ${successfulUploads}, failed: ${failedUploads}, queued: ${uploadQueue.length}`;
 
-    statusEl.textContent =
-      `Hands: ${handsDetected} | Camera: ${useFrontCamera ? "Front" : "Back"} | ` +
-      `frames: ${frameIndex}, rows: ${rows.length}`;
+    statusEl.textContent = base;
 
     ctx.restore();
   } catch (err) {
     console.error("onResults error:", err);
     statusEl.textContent = "onResults error (see console)";
-    // We don't stop running; just skip this frame.
   }
 }
 
 // -------------------------------------------------------------
-// CSV export (chunked)
+// Export current chunk
 // -------------------------------------------------------------
 function exportCurrentChunk() {
   if (rows.length === 0) return;
 
-  const headers = [
-    "frame", "time_sec",
-    "left_thumb_mcp", "left_thumb_ip",
-    "left_index_mcp", "left_index_pip", "left_index_dip",
-    "left_middle_mcp", "left_middle_pip", "left_middle_dip",
-    "left_ring_mcp", "left_ring_pip", "left_ring_dip",
-    "left_pinky_mcp", "left_pinky_pip", "left_pinky_dip",
-    "right_thumb_mcp", "right_thumb_ip",
-    "right_index_mcp", "right_index_pip", "right_index_dip",
-    "right_middle_mcp", "right_middle_pip", "right_middle_dip",
-    "right_ring_mcp", "right_ring_pip", "right_ring_dip",
-    "right_pinky_mcp", "right_pinky_pip", "right_pinky_dip"
-  ];
+  const rowsToExport = rows;
+  rows = [];
 
-  const lines = [];
-  lines.push(headers.join(","));
+  const participantId = participantInput.value.trim() || "unknown";
+  const cameraId = cameraInput.value.trim() || "unknown";
+  const trialId = trialIndex;
+  const chunkIndex = fileIndex;
 
-  for (const row of rows) {
-    const line = headers.map(h => (row[h] !== undefined ? row[h] : "")).join(",");
-    lines.push(line);
+  const { csvText } = buildCsvFromRows(rowsToExport);
+  const filename = getChunkFilename(participantId, cameraId, trialId, chunkIndex);
+
+  // Local backup
+  if (ENABLE_LOCAL_DOWNLOAD_BACKUP) {
+    const blob = new Blob([csvText], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
   }
 
-  const csv = lines.join("\n");
-  const blob = new Blob([csv], { type: "text/csv" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  const partStr = String(fileIndex).padStart(3, "0");
-  const filename = `hand_joint_angles_bothhands_${sessionTimestamp}_part${partStr}.csv`;
-
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+  // Cloud upload
+  if (
+    ENABLE_AUTO_UPLOAD &&
+    UPLOAD_URL &&
+    !UPLOAD_URL.includes("PASTE_YOUR_APPS_SCRIPT_WEB_APP_URL_HERE")
+  ) {
+    enqueueUpload({
+      participant_id: participantId,
+      camera_id: cameraId,
+      trial_id: trialId,
+      chunk_index: chunkIndex,
+      filename: filename,
+      csv_text: csvText
+    });
+  } else {
+    updateStatus(`Saved locally only: ${filename}`);
+  }
 
   fileIndex += 1;
-  rows = [];
 }
 
+// -------------------------------------------------------------
+// Manual download of remaining buffer
+// -------------------------------------------------------------
 function downloadCSV() {
   if (rows.length === 0) {
     alert("No data recorded in current chunk.");
@@ -443,9 +657,29 @@ function downloadCSV() {
 // Event handlers
 // -------------------------------------------------------------
 downloadBtn.addEventListener("click", downloadCSV);
+
 switchBtn.addEventListener("click", () => {
   useFrontCamera = !useFrontCamera;
   initCamera();
+});
+
+startBtn.addEventListener("click", () => {
+  if (!running) return;
+
+  if (!isRecording) {
+    trialIndex += 1;
+    frameIndex = 0;
+    startTime = performance.now();
+    isRecording = true;
+    updateStatus(`Started trial ${trialIndex}`);
+  }
+});
+
+stopBtn.addEventListener("click", () => {
+  if (isRecording) {
+    isRecording = false;
+    updateStatus(`Stopped trial ${trialIndex}`);
+  }
 });
 
 // -------------------------------------------------------------
