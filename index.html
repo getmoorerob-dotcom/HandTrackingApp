@@ -102,13 +102,12 @@
 // -------------------------------------------------------------
 // CONFIG
 // -------------------------------------------------------------
-// Paste your deployed Google Apps Script web app URL here
 const UPLOAD_URL = "https://script.google.com/macros/s/AKfycbyFuh6Huu-f5cHiBgOqPdsK4kKuS9HlXoj1ao5y39wsknR1lvqJ5FaB_U8Z93vFpo-a/exec";
 
-// Keep local CSV downloads as backup
+// Set to false for upload-only mode
 const ENABLE_LOCAL_DOWNLOAD_BACKUP = false;
 
-// Toggle auto upload
+// Keep upload enabled
 const ENABLE_AUTO_UPLOAD = true;
 
 // -------------------------------------------------------------
@@ -124,6 +123,11 @@ const startBtn = document.getElementById("startBtn");
 const stopBtn = document.getElementById("stopBtn");
 const participantInput = document.getElementById("participantInput");
 const cameraInput = document.getElementById("cameraInput");
+
+// Hide manual download button in upload-only mode
+if (!ENABLE_LOCAL_DOWNLOAD_BACKUP) {
+  downloadBtn.style.display = "none";
+}
 
 // -------------------------------------------------------------
 // Data storage for CSV (with chunking)
@@ -639,10 +643,16 @@ function exportCurrentChunk() {
 // Manual download of remaining buffer
 // -------------------------------------------------------------
 function downloadCSV() {
+  if (!ENABLE_LOCAL_DOWNLOAD_BACKUP) {
+    alert("Local CSV download is disabled. Data is uploading to Google Drive only.");
+    return;
+  }
+
   if (rows.length === 0) {
     alert("No data recorded in current chunk.");
     return;
   }
+
   exportCurrentChunk();
 }
 
