@@ -103,11 +103,7 @@
 // CONFIG
 // -------------------------------------------------------------
 const UPLOAD_URL = "https://script.google.com/macros/s/AKfycbyFuh6Huu-f5cHiBgOqPdsK4kKuS9HlXoj1ao5y39wsknR1lvqJ5FaB_U8Z93vFpo-a/exec";
-
-// Set to false for upload-only mode
 const ENABLE_LOCAL_DOWNLOAD_BACKUP = false;
-
-// Keep upload enabled
 const ENABLE_AUTO_UPLOAD = true;
 
 // -------------------------------------------------------------
@@ -124,13 +120,12 @@ const stopBtn = document.getElementById("stopBtn");
 const participantInput = document.getElementById("participantInput");
 const cameraInput = document.getElementById("cameraInput");
 
-// Hide manual download button in upload-only mode
 if (!ENABLE_LOCAL_DOWNLOAD_BACKUP) {
   downloadBtn.style.display = "none";
 }
 
 // -------------------------------------------------------------
-// Data storage for CSV (with chunking)
+// Data storage
 // -------------------------------------------------------------
 let rows = [];
 let frameIndex = 0;
@@ -140,8 +135,12 @@ let isRecording = false;
 let trialIndex = 0;
 
 const MAX_ROWS_PER_FILE = 7500;
-let fileIndex = 1;
 const sessionTimestamp = new Date().toISOString().replace(/[:.]/g, "-");
+
+// Per-trial metadata
+let activeParticipantId = "";
+let activeCameraId = "";
+let currentTrialChunkIndex = 1;
 
 // Camera state
 let useFrontCamera = true;
@@ -174,7 +173,7 @@ function angle3pts(A, B, C) {
 }
 
 // -------------------------------------------------------------
-// Finger angle helpers (safe)
+// Finger angle helpers
 // -------------------------------------------------------------
 function computeFingerAngles(lm, mcpIdx, pipIdx, dipIdx, tipIdx) {
   if (!lm || lm.length <= tipIdx) return [0, 0, 0];
@@ -238,9 +237,6 @@ const MANUAL_CONNECTIONS = [
   [0,17], [17,18], [18,19], [19,20]
 ];
 
-// -------------------------------------------------------------
-// Draw a single hand (fully defensive)
-// -------------------------------------------------------------
 function drawHand(lm, color) {
   if (!Array.isArray(lm) || lm.length === 0) return;
 
@@ -531,12 +527,9 @@ function onResults(results) {
       const elapsedSec = (performance.now() - startTime) / 1000.0;
       const wallTimeMs = Date.now();
 
-      const participantId = participantInput.value.trim() || "";
-      const cameraId = cameraInput.value.trim() || "";
-
       const row = {
-        participant_id: participantId,
-        camera_id: cameraId,
+        participant_id: activeParticipantId,
+        camera_id: activeCameraId,
         trial_id: trialIndex,
         frame: frameIndex,
         time_sec: elapsedSec.toFixed(6),
@@ -597,15 +590,14 @@ function exportCurrentChunk() {
   const rowsToExport = rows;
   rows = [];
 
-  const participantId = participantInput.value.trim() || "unknown";
-  const cameraId = cameraInput.value.trim() || "unknown";
+  const participantId = activeParticipantId || "unknown";
+  const cameraId = activeCameraId || "unknown";
   const trialId = trialIndex;
-  const chunkIndex = fileIndex;
+  const chunkIndex = currentTrialChunkIndex;
 
   const { csvText } = buildCsvFromRows(rowsToExport);
   const filename = getChunkFilename(participantId, cameraId, trialId, chunkIndex);
 
-  // Local backup
   if (ENABLE_LOCAL_DOWNLOAD_BACKUP) {
     const blob = new Blob([csvText], { type: "text/csv" });
     const url = URL.createObjectURL(blob);
@@ -618,7 +610,6 @@ function exportCurrentChunk() {
     URL.revokeObjectURL(url);
   }
 
-  // Cloud upload
   if (
     ENABLE_AUTO_UPLOAD &&
     UPLOAD_URL &&
@@ -636,7 +627,7 @@ function exportCurrentChunk() {
     updateStatus(`Saved locally only: ${filename}`);
   }
 
-  fileIndex += 1;
+  currentTrialChunkIndex += 1;
 }
 
 // -------------------------------------------------------------
@@ -668,21 +659,43 @@ switchBtn.addEventListener("click", () => {
 
 startBtn.addEventListener("click", () => {
   if (!running) return;
+  if (isRecording) return;
 
-  if (!isRecording) {
-    trialIndex += 1;
-    frameIndex = 0;
-    startTime = performance.now();
-    isRecording = true;
-    updateStatus(`Started trial ${trialIndex}`);
+  const participantId = participantInput.value.trim();
+  const cameraId = cameraInput.value.trim();
+
+  if (!participantId) {
+    alert("Please enter Participant ID before starting.");
+    return;
   }
+
+  if (rows.length > 0) {
+    exportCurrentChunk();
+  }
+
+  trialIndex += 1;
+  frameIndex = 0;
+  startTime = performance.now();
+  rows = [];
+
+  activeParticipantId = participantId;
+  activeCameraId = cameraId || "unknown";
+  currentTrialChunkIndex = 1;
+
+  isRecording = true;
+  updateStatus(`Started trial ${trialIndex}`);
 });
 
 stopBtn.addEventListener("click", () => {
-  if (isRecording) {
-    isRecording = false;
-    updateStatus(`Stopped trial ${trialIndex}`);
+  if (!isRecording) return;
+
+  isRecording = false;
+
+  if (rows.length > 0) {
+    exportCurrentChunk();
   }
+
+  updateStatus(`Stopped trial ${trialIndex}`);
 });
 
 // -------------------------------------------------------------
